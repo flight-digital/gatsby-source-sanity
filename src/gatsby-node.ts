@@ -21,7 +21,7 @@ import {extendImageNode} from './images/extendImageNode'
 import {SanityInputNode} from './types/gatsby'
 import {SanityDocument, SanityWebhookBody} from './types/sanity'
 import {CACHE_KEYS, getCacheKey} from './util/cache'
-import {prefixId, unprefixId} from './util/documentIds'
+import {isDraftId, prefixId, unprefixId} from './util/documentIds'
 import downloadDocuments from './util/downloadDocuments'
 import {
   ERROR_CODES,
@@ -272,8 +272,26 @@ export const sourceNodes: GatsbyNode['sourceNodes'] = async (
     typeMap,
   })
 
+  async function resourceDocuments(publishedIds: string[]) {
+    const batchSize = 1000
+    for (let i = 0; i < publishedIds.length; i += batchSize) {
+      const batch = publishedIds.slice(i, i + batchSize)
+      const ids = overlayDrafts ? [...batch, ...batch.map(prefixId)] : batch
+      const docs = await client.fetch<SanityDocument[]>(
+        '*[!(_type match "system.**") && _id in $ids]',
+        {ids},
+      )
+      docs.forEach((doc) => documents.set(doc._id, doc))
+      batch.forEach((id) => {
+        if (documents.has(id) || documents.has(prefixId(id))) {
+          syncWithGatsby(overlayDrafts ? prefixId(id) : id)
+        }
+      })
+    }
+  }
+
   // If we have a warm build, let's fetch only those which changed since the last build
-  const lastBuildTime = getLastBuildTime(args)
+  const lastBuildTime = getLastBuildTime(args, config)
   let deltaHandled = false
   if (lastBuildTime) {
     try {
@@ -301,23 +319,34 @@ export const sourceNodes: GatsbyNode['sourceNodes'] = async (
 
       // 3/4. From these types, get all nodes from store that are created from this plugin.
       // (we didn't use args.getNodes() as that'd be too expensive - hence why we limit it to Sanity-only types)
+      const idsToResource = new Set<string>()
       for (const docType of sanityDocTypes) {
         args
           .getNodesByType(docType)
           // 4/4. touch valid documents to prevent Gatsby from deleting them
           .forEach((node) => {
-            // If a document isn't included in documentIds, that means it was deleted since lastBuildTime. Don't touch it.
-            if (
-              node.internal.owner === 'gatsby-source-sanity' &&
-              typeof node._id === 'string' &&
-              (documentIds.has(node._id) || documentIds.has(unprefixId(node._id)))
-            ) {
+            if (node.internal.owner !== 'gatsby-source-sanity' || typeof node._id !== 'string') {
+              return
+            }
+
+            // Only keep a node if the exact document it was built from still exists, and never keep
+            // a node built from a draft when drafts aren't overlaid. Untouched nodes are deleted by Gatsby.
+            if (documentIds.has(node._id) && (overlayDrafts || !isDraftId(node._id))) {
               actions.touchNode(node)
               gatsbyNodes.set(unprefixId(node._id), node)
               documents.set(node._id, node as unknown as SanityDocument)
+            } else if (
+              documentIds.has(unprefixId(node._id)) ||
+              documentIds.has(prefixId(node._id))
+            ) {
+              // The document still exists in another form (e.g. a cached draft whose published
+              // version is unchanged), so it must be fetched again instead of reusing this node.
+              idsToResource.add(unprefixId(node._id))
             }
           })
       }
+
+      await resourceDocuments(Array.from(idsToResource))
 
       // With existing documents cached, let's handle those that changed since last build
       deltaHandled = await handleDeltaChanges({
@@ -325,6 +354,7 @@ export const sourceNodes: GatsbyNode['sourceNodes'] = async (
         lastBuildTime,
         client,
         syncWithGatsby,
+        config,
       })
       if (!deltaHandled) {
         reporter.warn(
@@ -408,7 +438,7 @@ export const sourceNodes: GatsbyNode['sourceNodes'] = async (
   }
 
   // register the current build time for accessing it in handleDeltaChanges for future builds
-  registerBuildTime(args)
+  registerBuildTime(args, config)
 }
 
 export const setFieldsOnGraphQLNodeType: GatsbyNode['setFieldsOnGraphQLNodeType'] = async (
