@@ -25,8 +25,8 @@ export interface ApiError {
 export interface SanityWebhookDeleteBody {
   operation: 'delete'
   documentId: string
-  projectId?: string
-  dataset?: string
+  projectId: string
+  dataset: string
 }
 
 export type SanityWebhookBody = SanityWebhookDeleteBody | {}

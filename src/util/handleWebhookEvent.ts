@@ -4,25 +4,28 @@ import debug from '../debug'
 import {SanityNode} from '../types/gatsby'
 import {SanityWebhookBody, SanityWebhookDeleteBody} from '../types/sanity'
 import {ProcessingOptions} from './normalize'
-import {unprefixId, safeId} from './documentIds'
+import {unprefixId, prefixId, safeId} from './documentIds'
 
 type deleteWebhookArgs = SourceNodesArgs & {webhookBody: SanityWebhookDeleteBody}
 
 /**
  * Gets a document id received from the webhook & delete it in the store.
+ *
+ * The webhook body is unauthenticated, so it is only used as a hint: the node is
+ * deleted only after Sanity confirms the document no longer exists.
  */
-function handleDeleteWebhook(
+async function handleDeleteWebhook(
   args: deleteWebhookArgs,
   options: {client: SanityClient; processingOptions: ProcessingOptions},
-) {
-  const {webhookBody, reporter} = args
+): Promise<boolean> {
+  const {webhookBody, reporter, getNode, createNodeId, actions} = args
 
   const {documentId: rawId, dataset, projectId} = webhookBody
 
   const publishedDocumentId = unprefixId(rawId)
   const config = options.client.config()
 
-  if (projectId && dataset && (config.projectId !== projectId || config.dataset !== dataset)) {
+  if (config.projectId !== projectId || config.dataset !== dataset) {
     return false
   }
 
@@ -32,16 +35,51 @@ function handleDeleteWebhook(
     return true
   }
 
-  handleDeletedDocuments(args, [publishedDocumentId])
+  const nodeId = safeId(publishedDocumentId, createNodeId)
+  const node = getNode(nodeId) as SanityNode | undefined
+  if (!node) {
+    return true
+  }
+
+  // With overlayDrafts the node may be backed by the draft, so both versions must be gone.
+  const idsBackingNode = options.processingOptions.overlayDrafts
+    ? [publishedDocumentId, prefixId(publishedDocumentId)]
+    : [publishedDocumentId]
+
+  let remaining: unknown[]
+  try {
+    remaining = (await options.client.getDocuments(idsBackingNode)).filter(Boolean)
+  } catch (err) {
+    reporter.warn(
+      `[sanity] Could not confirm deletion of document "${publishedDocumentId}" with Sanity, skipping delete: ${
+        err instanceof Error ? err.message : err
+      }`,
+    )
+    return true
+  }
+
+  if (remaining.length > 0) {
+    debug('Document %s still exists in Sanity, ignoring delete webhook', publishedDocumentId)
+    return true
+  }
+
+  const current = getNode(nodeId)
+  if (!current || current.internal.contentDigest !== node.internal.contentDigest) {
+    debug('Node for %s changed while confirming deletion, ignoring delete webhook', nodeId)
+    return true
+  }
+
+  debug('Deleted document with ID %s', node._id)
+  actions.deleteNode(node)
 
   reporter.info(`Deleted 1 document`)
   return true
 }
 
-export function handleWebhookEvent(
+export async function handleWebhookEvent(
   args: SourceNodesArgs & {webhookBody?: SanityWebhookBody},
   options: {client: SanityClient; processingOptions: ProcessingOptions},
-): boolean {
+): Promise<boolean> {
   const {webhookBody, reporter} = args
   const validated = validateWebhookPayload(webhookBody)
   if (validated === false) {
@@ -58,20 +96,6 @@ export function handleWebhookEvent(
   return false
 }
 
-function handleDeletedDocuments(context: SourceNodesArgs, ids: string[]) {
-  const {actions, createNodeId, getNode} = context
-  const {deleteNode} = actions
-
-  return ids
-    .map((documentId) => getNode(safeId(unprefixId(documentId), createNodeId)))
-    .filter((node): node is SanityNode => typeof node !== 'undefined')
-    .reduce((count, node) => {
-      debug('Deleted document with ID %s', node._id)
-      deleteNode(node)
-      return count + 1
-    }, 0)
-}
-
 export function validateWebhookPayload(
   payload: SanityWebhookBody | undefined,
 ): 'delete-operation' | false {
@@ -79,7 +103,14 @@ export function validateWebhookPayload(
     return false
   }
 
-  if ('operation' in payload && payload.operation === 'delete') {
+  if (
+    'operation' in payload &&
+    payload.operation === 'delete' &&
+    typeof payload.documentId === 'string' &&
+    payload.documentId.length > 0 &&
+    typeof payload.projectId === 'string' &&
+    typeof payload.dataset === 'string'
+  ) {
     return 'delete-operation'
   }
 
