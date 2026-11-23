@@ -248,7 +248,7 @@ export const sourceNodes: GatsbyNode['sourceNodes'] = async (
   // `webhookBody` is always present, even when sourceNodes is called in Gatsby's initialization.
   // As such, we need to check if it has any key to work with it.
   if (webhookBody && Object.keys(webhookBody).length > 0) {
-    const webhookHandled = handleWebhookEvent(args, {client, processingOptions})
+    const webhookHandled = await handleWebhookEvent(args, {client, processingOptions})
 
     // Even if the webhook body is invalid, let's avoid re-fetching all documents.
     // Otherwise, we'd be overloading Gatsby's preview servers on large datasets.
